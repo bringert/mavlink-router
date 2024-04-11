@@ -1082,7 +1082,7 @@ bool UdpEndpoint::setup(UdpEndpointConfig conf)
         return false;
     }
 
-    if (!this->open(conf.address.c_str(), conf.port, conf.mode)) {
+    if (!this->open(conf.address, conf.port, conf.mode)) {
         log_error("Could not open %s:%ld", conf.address.c_str(), conf.port);
         return false;
     }
@@ -1201,6 +1201,11 @@ int UdpEndpoint::open_ipv4(const char *ip, unsigned long port, UdpEndpointConfig
 
     sockaddr.sin_family = AF_INET;
     sockaddr.sin_addr.s_addr = inet_addr(ip);
+    if (sockaddr.sin_addr.s_addr == (in_addr_t)(-1)) {
+        log_error("Bad IPv4 address: '%s'", ip);
+        return -EINVAL;
+    }
+
     sockaddr.sin_port = htons(port);
 
     if (mode == UdpEndpointConfig::Mode::Server) {
@@ -1221,7 +1226,62 @@ fail:
     return -EINVAL;
 }
 
-bool UdpEndpoint::open(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode)
+bool UdpEndpoint::open(std::string &addr, unsigned long port, UdpEndpointConfig::Mode mode)
+{
+    if (validate_ip(addr)) {
+        return open_ip(addr.c_str(), port, mode);
+    } else {
+        return open_hostname(addr, port, mode);
+    }
+}
+
+bool UdpEndpoint::open_hostname(std::string &addr, unsigned long port, UdpEndpointConfig::Mode mode)
+{
+    struct addrinfo hints;
+    struct addrinfo *result;
+    char resolved_ip[INET6_ADDRSTRLEN];
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    log_debug("Looking up IP address of '%s'", addr.c_str());
+    int err = getaddrinfo(addr.c_str(), NULL, &hints, &result);
+    if (err != 0) {
+        log_error("Lookup for '%s' failed: %s", addr.c_str(), gai_strerror(err));
+        return false;
+    }
+
+    bool open_result = false;
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        const void *addr_ptr;
+        if (rp->ai_family == AF_INET) {
+            addr_ptr = &((const sockaddr_in *)rp->ai_addr)->sin_addr;
+        } else if (rp->ai_family == AF_INET6) {
+            addr_ptr = &((const sockaddr_in6 *)rp->ai_addr)->sin6_addr;
+        } else {
+            log_warning("Skipping unknown address family for '%s'", addr.c_str());
+            continue;
+        }
+        if (!inet_ntop(rp->ai_family, addr_ptr, resolved_ip, sizeof(resolved_ip))) {
+            log_error("inet_ntop failed for '%s': %s", addr.c_str(), strerror(errno));
+            continue;
+        }
+        log_info("Trying address %s for '%s'", resolved_ip, addr.c_str());
+        open_result = open_ip(resolved_ip, port, mode);
+        if (open_result) {
+            break;
+        }
+    }
+
+    freeaddrinfo(result);
+
+    return open_result;
+}
+
+bool UdpEndpoint::open_ip(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode)
 {
     const int broadcast_val = 1;
 
@@ -1229,9 +1289,13 @@ bool UdpEndpoint::open(const char *ip, unsigned long port, UdpEndpointConfig::Mo
 
     // setup the special IPv6/IPv4 part
     if (this->is_ipv6) {
-        open_ipv6(ip, port, mode);
+        if (open_ipv6(ip, port, mode) < 0) {
+            return false;
+        }
     } else {
-        open_ipv4(ip, port, mode);
+        if (open_ipv4(ip, port, mode) < 0) {
+            return false;
+        }
     }
 
     if (fd < 0) {
@@ -1415,12 +1479,13 @@ bool UdpEndpoint::validate_config(const UdpEndpointConfig &config)
         return false;
     }
 
-    if (!validate_ip(config.address)) {
-        log_error("UdpEndpoint %s: Invalid IP address %s",
-                  config.name.c_str(),
-                  config.address.c_str());
-        return false;
-    }
+    // TODO: need to allow hostnames
+    //if (!validate_ip(config.address)) {
+    //    log_error("UdpEndpoint %s: Invalid IP address %s",
+    //              config.name.c_str(),
+    //              config.address.c_str());
+    //    return false;
+    //}
 
     if (config.port == 0 || config.port == ULONG_MAX) {
         log_error("UdpEndpoint %s: Invalid or unset UDP port %lu",
@@ -1455,7 +1520,7 @@ bool TcpEndpoint::setup(TcpEndpointConfig conf)
         return false;
     }
 
-    this->_ip = conf.address;
+    this->_addr = conf.address;
     this->_port = conf.port;
     this->_retry_timeout = conf.retry_timeout;
 
@@ -1499,10 +1564,10 @@ bool TcpEndpoint::setup(TcpEndpointConfig conf)
 
     this->_group_name = conf.group;
 
-    if (!this->open(conf.address, conf.port)) {
+    if (!this->open(this->_addr, this->_port)) {
         log_warning("Could not open %s:%ld, re-trying every %d sec",
-                    conf.address.c_str(),
-                    conf.port,
+                    this->_addr.c_str(),
+                    this->_port,
                     this->_retry_timeout);
         if (this->_retry_timeout > 0) {
             _schedule_reconnect();
@@ -1516,7 +1581,7 @@ bool TcpEndpoint::setup(TcpEndpointConfig conf)
 
 bool TcpEndpoint::reopen()
 {
-    return this->open(_ip, _port);
+    return this->open(_addr, _port);
 }
 
 int TcpEndpoint::accept(int listener_fd)
@@ -1603,7 +1668,63 @@ int TcpEndpoint::open_ipv4(const char *ip, unsigned long port, sockaddr_in &sock
     return fd;
 }
 
-bool TcpEndpoint::open(const std::string &ip, unsigned long port)
+bool TcpEndpoint::open(const std::string &addr, unsigned long port)
+{
+    if (validate_ip(addr)) {
+        return open_ip(addr, port);
+    } else {
+        return open_hostname(addr, port);
+    }
+}
+
+bool TcpEndpoint::open_hostname(const std::string &addr, unsigned long port)
+{
+    struct addrinfo hints;
+    struct addrinfo *result;
+    char resolved_ip[INET6_ADDRSTRLEN];
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    log_debug("Looking up IP address of '%s'", addr.c_str());
+    int err = getaddrinfo(addr.c_str(), NULL, &hints, &result);
+    if (err != 0) {
+        log_error("Lookup for '%s' failed: %s", addr.c_str(), gai_strerror(err));
+        return false;
+    }
+
+    bool open_result = false;
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        const void *addr_ptr;
+        if (rp->ai_family == AF_INET) {
+            addr_ptr = &((const sockaddr_in *)rp->ai_addr)->sin_addr;
+        } else if (rp->ai_family == AF_INET6) {
+            addr_ptr = &((const sockaddr_in6 *)rp->ai_addr)->sin6_addr;
+        } else {
+            log_warning("Skipping unknown address family for '%s'", addr.c_str());
+            continue;
+        }
+        if (!inet_ntop(rp->ai_family, addr_ptr, resolved_ip, sizeof(resolved_ip))) {
+            log_error("inet_ntop failed for '%s': %s", addr.c_str(), strerror(errno));
+            continue;
+        }
+        log_info("Trying address %s for '%s'", resolved_ip, addr.c_str());
+        const std::string ip = resolved_ip;
+        open_result = open_ip(ip, port);
+        if (open_result) {
+            break;
+        }
+    }
+
+    freeaddrinfo(result);
+
+    return open_result;
+}
+
+bool TcpEndpoint::open_ip(const std::string &ip, unsigned long port)
 {
     this->is_ipv6 = ip_str_is_ipv6(ip.c_str());
 
@@ -1768,12 +1889,13 @@ bool TcpEndpoint::validate_config(const TcpEndpointConfig &config)
         return false;
     }
 
-    if (!validate_ip(config.address)) {
-        log_error("TcpEndpoint %s: Invalid IP address %s",
-                  config.name.c_str(),
-                  config.address.c_str());
-        return false;
-    }
+    // TODO: need to allow hostnames
+    //if (!validate_ip(config.address)) {
+    //    log_error("TcpEndpoint %s: Invalid IP address %s",
+    //              config.name.c_str(),
+    //              config.address.c_str());
+    //    return false;
+    //}
 
     if (config.port == 0 || config.port == ULONG_MAX) {
         log_error("TcpEndpoint %s: Invalid or unset TCP port %lu",
@@ -1802,7 +1924,7 @@ void TcpEndpoint::_schedule_reconnect()
     if (t == nullptr) {
         log_warning("Could not create retry timeout for TCP endpoint %s:%lu\n"
                     "No attempts to reconnect will be made",
-                    _ip.c_str(),
+                    _addr.c_str(),
                     _port);
     }
 }
